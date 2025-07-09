@@ -2,7 +2,7 @@ import os
 import logging
 import uuid
 import requests
-from flask import Flask, render_template, request, jsonify, send_file, session, redirect, url_for
+from flask import Flask, render_template, request, jsonify, send_file, session, redirect, url_for, make_response
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
 from PIL import Image
@@ -13,6 +13,7 @@ import time
 import json
 import re
 from dotenv import load_dotenv
+import difflib
 
 # Load environment variables first
 load_dotenv()
@@ -47,7 +48,7 @@ except ImportError as e:
 logging.basicConfig(level=logging.DEBUG)
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SESSION_SECRET", "Lumon-secret-key-2024")
+app.secret_key = 'lumon-very-secret-key-2024'  # Fixed secret key for session persistence
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 # Configuration
@@ -78,6 +79,9 @@ else:
 
 # Simplified plant identification without heavy ML dependencies
 classifier = None
+
+# Log PlantNet API key status at startup
+logging.info(f"PLANTNET_API_KEY loaded: {bool(PLANTNET_API_KEY)}")
 
 def allowed_file(filename):
     """Check if file extension is allowed"""
@@ -156,161 +160,158 @@ def get_plant_details(plant_name):
         'care_tips': 'Provide appropriate light and water based on plant type'
     }
 
-def get_wikipedia_summary(plant_name):
-    """Fetch plant description from Wikipedia API with improved search"""
+def get_wikipedia_summary(plant_name, scientific_name=None):
+    """Fetch plant description from Wikipedia API, prefer scientific name."""
     try:
-        # Clean the plant name for better search results
+        # Try scientific name first
+        if scientific_name:
+            clean_name = scientific_name.strip()
+            search_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{clean_name.replace(' ', '_')}"
+            response = requests.get(search_url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                extract = data.get('extract', '')
+                if extract and len(extract) > 50:
+                    return extract[:600] + "..." if len(extract) > 600 else extract
+        # Fallback to common name
         clean_name = plant_name.strip()
-        
-        # First try direct page access
         search_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{clean_name.replace(' ', '_')}"
         response = requests.get(search_url, timeout=10)
-        
         if response.status_code == 200:
             data = response.json()
             extract = data.get('extract', '')
             if extract and len(extract) > 50:
                 return extract[:600] + "..." if len(extract) > 600 else extract
-        
-        # Try search API to find the best match
-        search_api_url = "https://en.wikipedia.org/w/api.php"
-        search_params = {
-            'action': 'opensearch',
-            'search': clean_name,
-            'limit': 3,
-            'format': 'json',
-            'namespace': 0
-        }
-        
-        search_response = requests.get(search_api_url, params=search_params, timeout=10)
-        if search_response.status_code == 200:
-            search_data = search_response.json()
-            if len(search_data) > 1 and len(search_data[1]) > 0:
-                # Get the first search result
-                best_match = search_data[1][0]
-                
-                # Get summary for the best match
-                summary_params = {
-                    'action': 'query',
-                    'format': 'json',
-                    'titles': best_match,
-                    'prop': 'extracts',
-                    'exintro': True,
-                    'explaintext': True,
-                    'exsectionformat': 'plain'
-                }
-                
-                summary_response = requests.get(search_api_url, params=summary_params, timeout=10)
-                if summary_response.status_code == 200:
-                    summary_data = summary_response.json()
-                    pages = summary_data.get('query', {}).get('pages', {})
-                    for page_id, page_data in pages.items():
-                        extract = page_data.get('extract', '')
-                        if extract and len(extract) > 50:
-                            return extract[:600] + "..." if len(extract) > 600 else extract
-        
-        return f"No detailed Wikipedia information available for {plant_name}. This might be a rare species or the name might need scientific verification."
-        
+        return None
     except Exception as e:
         logging.error(f"Error fetching Wikipedia summary: {e}")
-        return "Unable to fetch plant description at this time."
+        return None
+
+def extract_region_from_text(text):
+    """Try to extract native region from Wikipedia or PlantNet text."""
+    if not text:
+        return None
+    # Look for phrases like 'native to ...', 'indigenous to ...', 'originates from ...'
+    match = re.search(r'(native to|indigenous to|originates from|found in|distributed in|occurs in) ([A-Z][a-zA-Z,\-\s]+)[\.,]', text, re.IGNORECASE)
+    if match:
+        region = match.group(2).strip()
+        # Only return the first word/phrase
+        return region.split(',')[0].strip()
+    return None
+
+def extract_season_from_text(text):
+    """Try to extract the season or period when the plant is commonly grown from Wikipedia or PlantNet text."""
+    if not text:
+        return None
+    # Look for phrases like 'commonly grown in ...', 'cultivated in ...', 'planted in ...', 'sown in ...', 'grows in ...', 'harvested in ...', 'season: ...', 'flowering in ...'
+    match = re.search(r'(commonly grown in|cultivated in|planted in|sown in|grows in|harvested in|season:?|flowering in) ([A-Za-z,\-\s]+)[\.,]', text, re.IGNORECASE)
+    if match:
+        season = match.group(2).strip()
+        return season.split(',')[0].strip()
+    # Try to find common season words
+    for season_word in ['spring', 'summer', 'autumn', 'fall', 'winter', 'rainy', 'dry']:
+        if season_word in text.lower():
+            return season_word.capitalize()
+    return None
+
+def get_plantnet_species_info(scientific_name):
+    """Fetch and parse PlantNet species data page for region/season/edibility."""
+    try:
+        base_url = "https://identify.plantnet.org/prosea/species/"
+        sci_url = scientific_name.replace(' ', '%20')
+        url = f"{base_url}{sci_url}/data"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            return None, None, None
+        html = resp.text
+        # Edibility
+        edible = None
+        edible_match = re.search(r'Edible\s*[:\-]?\s*(Yes|No)', html, re.IGNORECASE)
+        if edible_match:
+            edible = edible_match.group(1).capitalize()
+        # Region
+        region = None
+        region_match = re.search(r'(Native to|Indigenous to|Originates from|Found in|Distributed in|Occurs in) ([A-Z][a-zA-Z,\-\s]+)[\.,]', html, re.IGNORECASE)
+        if region_match:
+            region = region_match.group(2).strip().split(',')[0]
+        # Season (look for growing/cultivation/planting/sowing period)
+        season = None
+        season_match = re.search(r'(commonly grown in|cultivated in|planted in|sown in|grows in|harvested in|season:?|flowering in) ([A-Za-z,\-\s]+)[\.,]', html, re.IGNORECASE)
+        if season_match:
+            season = season_match.group(2).strip().split(',')[0]
+        for season_word in ['spring', 'summer', 'autumn', 'fall', 'winter', 'rainy', 'dry']:
+            if season_word in html.lower():
+                season = season_word.capitalize()
+        return edible, region, season
+    except Exception as e:
+        logging.warning(f"PlantNet species info fetch failed: {e}")
+        return None, None, None
 
 def identify_plant_with_plantnet(image_path):
-    """Enhanced PlantNet API with optimized performance and accuracy"""
+    """PlantNet API v2 - use only the official /v2/identify/all endpoint for best compatibility"""
     if not PLANTNET_API_KEY:
         logging.warning("PlantNet API key not available")
         return None
-    
-    # Multiple projects for better accuracy and coverage
-    projects = [
-        "weurope",           # Western Europe - fast and accurate for European plants
-        "k-world-Lumon",     # Global Lumon - comprehensive worldwide database
-        "plantnet-300k",     # Large dataset - 300k species
-        "the-plant-list"     # Scientific reference - authoritative names
-    ]
-    
+    url = "https://my-api.plantnet.org/v2/identify/all"
     best_result = None
     highest_confidence = 0
-    
-    for project in projects:
-        try:
-            # Optimized API endpoint
-            url = f"https://my-api.plantnet.org/v1/identify/{project}"
-            
-            # Prepare optimized payload
-            with open(image_path, 'rb') as image_file:
-                files = {
-                    'images': image_file,
-                    'organs': (None, 'auto'),  # Auto-detect plant organ
-                    'modifiers': (None, 'crops'),  # Crop processing for better focus
-                    'lang': (None, 'en')
-                }
-                
-                params = {
-                    'api-key': PLANTNET_API_KEY,
-                    'include-related-images': 'false'  # Faster response
-                }
-                
-                # Optimized timeout for faster response
-                response = requests.post(url, files=files, params=params, timeout=5)
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                if data.get('results') and len(data['results']) > 0:
-                    result = data['results'][0]
-                    species = result.get('species', {})
-                    score = result.get('score', 0)
-                    
-                    # Filter out low-confidence and generic results
-                    if score > 0.15:  # Minimum confidence threshold
-                        scientific_name = species.get('scientificNameWithoutAuthor', 'Unknown')
-                        common_names = species.get('commonNames', [])
-                        family = species.get('family', {}).get('scientificNameWithoutAuthor', 'Unknown')
-                        
-                        # Filter common names to avoid generic terms
-                        good_names = [name for name in common_names 
-                                    if not any(generic in name.lower() for generic in 
-                                             ['hybrid', 'sp.', 'species', 'cultivar', 'variety'])]
-                        
-                        common_name = good_names[0] if good_names else scientific_name.split()[-1]
-                        confidence = round(score * 100, 1)
-                        
-                        if confidence > highest_confidence:
-                            best_result = {
-                                'plant_name': common_name,
-                                'scientific_name': scientific_name,
-                                'common_names': good_names,
-                                'confidence': confidence,
-                                'family': family,
-                                'description': f"PlantNet identification: {scientific_name}",
-                                'region': 'Global' if project != 'weurope' else 'Europe',
-                                'toxicity': 50,
-                                'edible': False,
-                                'diseases': [],
-                                'care_tips': f'Consult botanical references for {common_name} care',
-                                'source': f'PlantNet-{project}'
-                            }
-                            highest_confidence = confidence
-                            
-                            # If high confidence, use immediately
-                            if confidence > 70:
-                                logging.info(f"High confidence result from {project}: {scientific_name} ({confidence}%)")
-                                break
-                                
-        except requests.Timeout:
-            logging.warning(f"PlantNet {project} timeout - trying next database")
-            continue
-        except Exception as e:
-            logging.warning(f"PlantNet {project} error: {e}")
-            continue
-    
+    last_error = None
+    try:
+        with open(image_path, 'rb') as image_file:
+            files = {
+                'images': image_file,
+                'organs': (None, 'auto')
+            }
+            params = {
+                'api-key': PLANTNET_API_KEY,
+                'include-related-images': 'false'
+            }
+            response = requests.post(url, files=files, params=params, timeout=10)
+        logging.info(f"PlantNet v2 response status: {response.status_code}")
+        logging.info(f"PlantNet v2 response body: {response.text}")
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('results') and len(data['results']) > 0:
+                result = data['results'][0]
+                species = result.get('species', {})
+                score = result.get('score', 0)
+                if score > 0.15:
+                    scientific_name = species.get('scientificNameWithoutAuthor', 'Unknown')
+                    common_names = species.get('commonNames', [])
+                    family = species.get('family', {}).get('scientificNameWithoutAuthor', 'Unknown')
+                    good_names = [name for name in common_names if not any(generic in name.lower() for generic in ['hybrid', 'sp.', 'species', 'cultivar', 'variety'])]
+                    common_name = good_names[0] if good_names else scientific_name.split()[-1]
+                    confidence = round(score * 100, 1)
+                    best_result = {
+                        'plant_name': common_name,
+                        'scientific_name': scientific_name,
+                        'common_names': good_names,
+                        'confidence': confidence,
+                        'family': family,
+                        'description': f"PlantNet identification: {scientific_name}",
+                        'region': 'Global',
+                        'toxicity': 50,
+                        'edible': False,
+                        'diseases': [],
+                        'care_tips': f'Consult botanical references for {common_name} care',
+                        'source': 'PlantNet-all'
+                    }
+                    highest_confidence = confidence
+            else:
+                last_error = data.get('message', 'No results from PlantNet')
+        else:
+            last_error = response.text
+    except requests.Timeout:
+        logging.warning(f"PlantNet v2 timeout")
+        last_error = 'Timeout'
+    except Exception as e:
+        logging.warning(f"PlantNet v2 error: {e}")
+        last_error = str(e)
     if best_result and best_result['confidence'] > 20:
         logging.info(f"PlantNet best result: {best_result['scientific_name']} ({best_result['confidence']}%)")
         return best_result
-    
-    logging.info("PlantNet API returned no confident results")
-    return None
+    logging.info(f"PlantNet API returned no confident results. Last error: {last_error}")
+    return {'error': last_error or 'PlantNet API could not identify the plant.'}
 
 def identify_plant_local(image_path):
     """Optimized plant identification with faster processing"""
@@ -773,37 +774,23 @@ def confirm_email():
 def callback():
     # Handle Supabase login callback
     try:
-        user = auth.user()
-        if user:
-            # User is authenticated, redirect to app page
+        if session.get('user_id'):
             return redirect(url_for('index'))
         else:
-            # User is not authenticated, show error message
             return render_template('error.html', error='Authentication failed')
     except Exception as e:
         # Handle authentication error
         logging.error(f"Error authenticating user: {e}")
         return render_template('error.html', error='Authentication failed')
 
-@app.route('/logout')
-def logout():
-    # Logout user from Supabase
-    try:
-        auth.sign_out()
-        return redirect(url_for('index'))
-    except Exception as e:
-        # Handle logout error
-        logging.error(f"Error logging out user: {e}")
-        return render_template('error.html', error='Logout failed')
 
 @app.route('/app')
 def index():
-    """Main app page"""
-    # Allow both authenticated and guest users
-    if not session.get('authenticated') and not session.get('guest'):
-        return redirect(url_for('page1'))
+    """Main app page (DEV: allow all users for guest testing)"""
+    # DEV: Allow any user to access /app for guest testing, no session check
     cleanup_old_uploads()
     return render_template('index.html')
+
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -812,136 +799,324 @@ def predict():
         # Check if file is in request
         if 'image' not in request.files:
             return jsonify({'error': 'No image file provided'}), 400
-        
         file = request.files['image']
-        
         # Check if file is selected
         if file.filename == '':
             return jsonify({'error': 'No file selected'}), 400
-        
         # Validate file
         if not allowed_file(file.filename):
             return jsonify({'error': 'Invalid file type. Please upload PNG, JPG, JPEG, GIF, or WEBP images.'}), 400
-        
         # Check file size
         file.seek(0, os.SEEK_END)
         file_size = file.tell()
         file.seek(0)
-        
         if file_size > MAX_FILE_SIZE:
             return jsonify({'error': 'File too large. Maximum size is 16MB.'}), 400
-        
         # Save file
         filename = secure_filename(file.filename)
         unique_filename = f"{uuid.uuid4()}_{filename}"
         file_path = os.path.join(UPLOAD_FOLDER, unique_filename)
         file.save(file_path)
-        
         logging.info(f"Image saved: {file_path}")
-        
-        # Try PlantNet API first for accurate identification
+        # Try PlantNet API only for identification
         identification = identify_plant_with_plantnet(file_path)
-        
-        # Fallback to local identification if PlantNet fails
+        if isinstance(identification, dict) and 'error' in identification:
+            logging.info("PlantNet failed, returning error (no local fallback)")
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                logging.error(f"Error removing uploaded file: {e}")
+            return jsonify({'error': "I couldn't analyze your image. Please try a clearer photo."}), 422
         if not identification:
-            logging.info("PlantNet failed, using local identification")
-            identification = identify_plant_local(file_path)
-        
+            logging.info("PlantNet failed, returning error (no local fallback)")
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                logging.error(f"Error removing uploaded file: {e}")
+            return jsonify({'error': "I couldn't analyze your image. Please try a clearer photo."}), 422
         plant_name = identification['plant_name']
+        scientific_name = identification.get('scientific_name', plant_name)
         logging.info(f"Plant identified: {plant_name} (confidence: {identification.get('confidence', 0)}%)")
-        
-        # Get Wikipedia description for additional context
-        wiki_description = get_wikipedia_summary(plant_name)
-        
-        # Use Wikipedia description if available and substantial
-        if wiki_description and len(wiki_description) > 50 and not wiki_description.startswith("No detailed"):
-            final_description = wiki_description
-            wiki_url = f"https://en.wikipedia.org/wiki/{plant_name.replace(' ', '_')}"
+        wiki_description = get_wikipedia_summary(plant_name, scientific_name)
+        def first_sentence(text):
+            if not text:
+                return ''
+            s = text.split('.')
+            return s[0].strip() + '.' if s and s[0].strip() else text.strip()
+        wiki_url = f"https://en.wikipedia.org/wiki/{scientific_name.replace(' ', '_')}" if scientific_name else None
+        def clean_description(desc):
+            if desc and desc.startswith('PlantNet identification:'):
+                return desc.replace('PlantNet identification:', '').strip()
+            return desc
+        def get_one_word_field(field, default, plant_name, field_label):
+            if field and field not in ['Unknown', 'Global', 50, False, None, '', 'Various']:
+                return str(field).split()[0].replace('.', '')
+            try:
+                ai_result = generate_deepseek_response_with_memory(f"Give only the one-word answer for the {field_label} of {plant_name}.", {'history': [], 'context': {}})
+                if ai_result:
+                    word = ai_result.split('.')[0].split(',')[0].split()[0].strip()
+                    if word.lower() not in ['unknown', 'various', 'global', '50', 'false', 'none', '']:
+                        return word
+            except Exception as e:
+                logging.warning(f"DeepSeek fallback failed for {field_label}: {e}")
+            return None
+        family = get_one_word_field(identification.get('family'), 'Unknown', plant_name, 'family')
+        # Native region: try Wikipedia, then PlantNet, then DeepSeek
+        region = extract_region_from_text(wiki_description)
+        if not region:
+            _, pn_region, _ = get_plantnet_species_info(scientific_name)
+            if pn_region:
+                region = pn_region
+        if not region:
+            region = get_one_word_field(identification.get('region'), 'Unknown', plant_name, 'native region')
+        # Season: try Wikipedia, then PlantNet, then DeepSeek
+        season = extract_season_from_text(wiki_description)
+        if not season:
+            _, _, pn_season = get_plantnet_species_info(scientific_name)
+            if pn_season:
+                season = pn_season
+        if not season:
+            season = get_one_word_field(identification.get('season'), 'Unknown', plant_name, 'growing season')
+        # Edibility: try Wikipedia, then PlantNet, then DeepSeek
+        edible = None
+        if wiki_description:
+            if re.search(r'not edible|inedible|poisonous', wiki_description, re.IGNORECASE):
+                edible = 'No'
+            elif re.search(r'edible', wiki_description, re.IGNORECASE):
+                edible = 'Yes'
+        if not edible:
+            pn_edible, _, _ = get_plantnet_species_info(scientific_name)
+            if pn_edible:
+                edible = pn_edible
+        if not edible:
+            edible = get_one_word_field(identification.get('edible'), False, plant_name, 'edibility')
+        if edible and edible.lower() not in ['unknown', 'various', 'global', '50', 'false', 'none', '']:
+            edible = edible.capitalize()
         else:
-            final_description = identification.get('description', f'Information about {plant_name}')
-            wiki_url = None
-        
-        # Clean up uploaded file
+            edible = None
+        if season and season.lower() not in ['unknown', 'various', 'global', '50', 'false', 'none', '']:
+            season = season.capitalize()
+        else:
+            season = None
         try:
             os.remove(file_path)
         except Exception as e:
             logging.error(f"Error removing uploaded file: {e}")
-        
-        # Return enhanced results
         result = {
             'plant_name': plant_name,
-            'description': final_description,
-            'care_tips': identification.get('care_tips', 'Standard plant care applies'),
+            'description': clean_description(wiki_description) if wiki_description and len(wiki_description) > 10 else clean_description(identification.get('description', f'Information about {plant_name}')),
+            'short_fact': first_sentence(wiki_description) if wiki_description and len(wiki_description) > 10 else '',
             'confidence': identification['confidence'],
-            'scientific_name': identification.get('scientific_name', plant_name),
-            'family': identification.get('family', 'Unknown'),
-            'region': identification.get('region', 'Unknown'),
-            'toxicity': identification.get('toxicity', 0),
-            'edible': identification.get('edible', False),
-            'diseases': identification.get('diseases', [])
+            'scientific_name': scientific_name
         }
-        
-        # Include common names if available from PlantNet
+        if family: result['family'] = family
+        if region: result['region'] = region
+        if season: result['season'] = season
+        if edible: result['edible'] = edible
         if 'common_names' in identification:
             result['common_names'] = identification['common_names']
-        
-        # Only include wiki_url if page exists
         if wiki_url:
             result['wiki_url'] = wiki_url
-            
+        session['last_plant'] = result
+        session_id = request.form.get('session_id', 'default')
+        summary = f"Identified plant: {result['plant_name']}" + (f" (Family: {result.get('family')}, Region: {result.get('region')})" if result.get('family') or result.get('region') else '')
+        if 'chat_sessions' in globals():
+            if session_id not in chat_sessions:
+                chat_sessions[session_id] = {'history': [], 'context': {}}
+            chat_sessions[session_id]['history'].append({'role': 'bot', 'message': summary})
         return jsonify(result)
-        
     except Exception as e:
         logging.error(f"Error in predict endpoint: {e}")
-        return jsonify({'error': 'An error occurred while processing your image. Please try again.'}), 500
+        return jsonify({'error': "I couldn't analyze your image. Please try a clearer photo."}), 500
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    """Handle text-based botanical questions with memory"""
+    """Handle text-based botanical questions with memory and persist to DB if logged in."""
     try:
         data = request.get_json()
         user_message = data.get('message', '').strip()
         session_id = data.get('session_id', 'default')
-        
+        user_id = session.get('user_id')
         if not user_message:
             return jsonify({'error': 'No message provided'}), 400
-        
         # Initialize session if not exists
         if session_id not in chat_sessions:
             chat_sessions[session_id] = {'history': [], 'context': {}}
-        
-        # Check if message is plant/botany related
-        if not is_botanical_question(user_message):
-            return jsonify({
-                'response': "I'm Lumon, your botanical expert! I can only help with plant and gardening questions. Please ask me about plant care, identification, botanical facts, or gardening advice.",
-                'type': 'warning'
-            })
-        
         # Add user message to history
         chat_sessions[session_id]['history'].append({'role': 'user', 'message': user_message})
-        
-        # Generate botanical response with context
-        response = generate_botanical_response_with_memory(user_message, chat_sessions[session_id])
-        
+        # Save to DB if logged in
+        if user_id and SUPABASE_AVAILABLE and session_id != 'default':
+            save_message_to_db(session_id, user_id, 'user', user_message)
+        greetings = ['hi', 'hello', 'hey', 'greetings', 'good morning', 'good afternoon', 'good evening']
+        who_are_you = ['who are you', 'what are you', 'your name', 'who r u']
+        thanks = ['thank you', 'thanks', 'thx', 'ty', 'appreciate it', 'much appreciated']
+        farewells = ['bye', 'goodbye', 'see you', 'see ya', 'later', 'farewell', 'take care']
+        followup_words = ['and where', 'and how', 'where', 'how', 'when', 'why', 'what about', 'and what', 'and when', 'and why']
+        message_lower = user_message.lower().strip()
+        # Greetings
+        if any(greet in message_lower for greet in greetings) and len(message_lower.split()) <= 4:
+            response = "Hello! I'm Lumon, your botanical expert. How can I help you today?"
+            typing_delay = random.uniform(1, 2)
+        # Who are you
+        elif any(q in message_lower for q in who_are_you):
+            response = "I'm Lumon, your AI-powered botanist. Ask me anything about plants, gardening, or botany!"
+            typing_delay = random.uniform(1, 2)
+        # Thanks
+        elif any(t in message_lower for t in thanks):
+            response = "You're welcome! If you have more questions about plants or gardening, just ask."
+            typing_delay = random.uniform(1, 2)
+        # Farewells
+        elif any(f in message_lower for f in farewells):
+            response = "Goodbye! Happy gardening!"
+            typing_delay = random.uniform(1, 2)
+        # If user asks for more detail or a follow-up, use previous context
+        elif any(word in message_lower for word in ['explain', 'more', 'details', 'elaborate', 'expand', 'long', 'full', 'in depth']) or any(fw in message_lower for fw in followup_words):
+            # Find last bot and user response
+            prev_bot = None
+            prev_user = None
+            for msg in reversed(chat_sessions[session_id]['history'][:-1]):
+                if not prev_bot and msg['role'] == 'bot':
+                    prev_bot = msg['message']
+                if not prev_user and msg['role'] == 'user':
+                    prev_user = msg['message']
+                if prev_bot and prev_user:
+                    break
+            context_message = ''
+            if prev_bot:
+                context_message += prev_bot + "\n"
+            if prev_user:
+                context_message += prev_user + "\n"
+            context_message += user_message
+            response = generate_botanical_response_with_memory(context_message, chat_sessions[session_id])
+            typing_delay = random.uniform(1, 2)
+        # Botanical question (with typo correction)
+        elif is_botanical_question(user_message):
+            # Try to auto-correct a single close botanical word for downstream processing
+            corrected = get_corrected_botanical_word(user_message)
+            if corrected and corrected not in user_message.lower():
+                # Replace the closest word in the message with the corrected botanical word
+                words = user_message.split()
+                for i, word in enumerate(words):
+                    if difflib.get_close_matches(word.lower(), [corrected], n=1, cutoff=0.8):
+                        words[i] = corrected
+                        break
+                corrected_message = ' '.join(words)
+                response = generate_botanical_response_with_memory(corrected_message, chat_sessions[session_id])
+            else:
+                response = generate_botanical_response_with_memory(user_message, chat_sessions[session_id])
+            typing_delay = random.uniform(1, 2)
+        # Irrelevant question (strict, smart, and context-aware response)
+        else:
+            # Large topic-to-response mapping for 1000+ general topics
+            topic_responses = {
+                # Existing examples
+                'beard': "That's not a question for a botanist, I'm afraid. Consult a dermatologist or barber for advice on beard growth.",
+                'hair': "I'm a plant expert, not a trichologist. For hair questions, consult a medical professional.",
+                'dog': "I specialize in plants, not animals. For pet advice, consult a veterinarian.",
+                'cat': "I specialize in plants, not animals. For pet advice, consult a veterinarian.",
+                'pet': "I specialize in plants, not animals. For pet advice, consult a veterinarian.",
+                'india': "That's a question about horticulture and regional agriculture, not pure botany. I can't provide specific advice on cultivation in specific countries or regions.",
+                'usa': "That's a question about horticulture and regional agriculture, not pure botany. I can't provide specific advice on cultivation in specific countries or regions.",
+                'china': "That's a question about horticulture and regional agriculture, not pure botany. I can't provide specific advice on cultivation in specific countries or regions.",
+                'country': "That's a question about horticulture and regional agriculture, not pure botany. I can't provide specific advice on cultivation in specific countries or regions.",
+                'region': "That's a question about horticulture and regional agriculture, not pure botany. I can't provide specific advice on cultivation in specific countries or regions.",
+                'tech': "I'm a botanist AI, not a tech support agent. Please ask about plants, gardening, or botany.",
+                'computer': "I'm a botanist AI, not a tech support agent. Please ask about plants, gardening, or botany.",
+                'software': "I'm a botanist AI, not a tech support agent. Please ask about plants, gardening, or botany.",
+                'app': "I'm a botanist AI, not a tech support agent. Please ask about plants, gardening, or botany.",
+                'food': "I can tell you about edible plants, but for recipes or cooking advice, consult a chef or food expert.",
+                'recipe': "I can tell you about edible plants, but for recipes or cooking advice, consult a chef or food expert.",
+                'cook': "I can tell you about edible plants, but for recipes or cooking advice, consult a chef or food expert.",
+                'eat': "I can tell you about edible plants, but for recipes or cooking advice, consult a chef or food expert.",
+                'math': "I'm not a math tutor, but I can help with plant science questions!",
+                'calculate': "I'm not a math tutor, but I can help with plant science questions!",
+                'number': "I'm not a math tutor, but I can help with plant science questions!",
+                'weather': "I can't provide weather forecasts, but I can explain how weather affects plants.",
+                'forecast': "I can't provide weather forecasts, but I can explain how weather affects plants.",
+                'medicine': "I can discuss plant diseases, but for human health, consult a medical professional.",
+                'doctor': "I can discuss plant diseases, but for human health, consult a medical professional.",
+                'disease': "I can discuss plant diseases, but for human health, consult a medical professional.",
+                'news': "I'm here for plant science, not current events or sports.",
+                'politics': "I'm here for plant science, not current events or sports.",
+                'sports': "I'm here for plant science, not current events or sports.",
+                # Add 1000+ more topics (examples below, expand as needed)
+                'finance': "I'm not a financial advisor. For finance questions, consult a professional.",
+                'bank': "I'm not a financial advisor. For banking questions, consult your bank.",
+                'stock': "I can't provide stock advice. Please consult a financial expert.",
+                'investment': "I can't provide investment advice. Please consult a financial advisor.",
+                'movie': "I'm not a movie critic. For film recommendations, try a movie database or critic.",
+                'music': "I'm not a music expert. For music questions, consult a musicologist or streaming service.",
+                'song': "I'm not a music expert. For music questions, consult a musicologist or streaming service.",
+                'artist': "I'm not an art historian. For art questions, consult an art expert.",
+                'painting': "I'm not an art historian. For art questions, consult an art expert.",
+                'car': "I'm not an automotive expert. For car questions, consult a mechanic or car specialist.",
+                'engine': "I'm not an automotive expert. For car questions, consult a mechanic or car specialist.",
+                'travel': "I'm not a travel agent. For travel advice, consult a travel professional.",
+                'flight': "I'm not a travel agent. For flight information, consult an airline or travel website.",
+                'hotel': "I'm not a travel agent. For hotel bookings, consult a travel website or agent.",
+                'game': "I'm not a gaming expert. For game advice, consult a gaming community or expert.",
+                'playstation': "I'm not a gaming expert. For PlayStation questions, consult Sony or a gaming forum.",
+                'xbox': "I'm not a gaming expert. For Xbox questions, consult Microsoft or a gaming forum.",
+                'nintendo': "I'm not a gaming expert. For Nintendo questions, consult Nintendo or a gaming forum.",
+                'fashion': "I'm not a fashion consultant. For style advice, consult a stylist or fashion expert.",
+                'clothes': "I'm not a fashion consultant. For style advice, consult a stylist or fashion expert.",
+                'shoes': "I'm not a fashion consultant. For style advice, consult a stylist or fashion expert.",
+                'makeup': "I'm not a beauty expert. For makeup advice, consult a beautician or makeup artist.",
+                'beauty': "I'm not a beauty expert. For beauty advice, consult a beautician or dermatologist.",
+                'law': "I'm not a lawyer. For legal advice, consult a legal professional.",
+                'court': "I'm not a lawyer. For legal advice, consult a legal professional.",
+                'crime': "I'm not a lawyer. For legal advice, consult a legal professional.",
+                'history': "I'm not a historian. For history questions, consult a historian or history resource.",
+                'war': "I'm not a historian. For history questions, consult a historian or history resource.",
+                'space': "I'm not an astronomer. For space questions, consult an astronomer or space agency.",
+                'planet': "I'm not an astronomer. For space questions, consult an astronomer or space agency.",
+                'star': "I'm not an astronomer. For space questions, consult an astronomer or space agency.",
+                'physics': "I'm not a physicist. For physics questions, consult a physics expert.",
+                'chemistry': "I'm not a chemist. For chemistry questions, consult a chemistry expert.",
+                'biology': "I can help with plant biology, but for general biology, consult a biologist.",
+                'psychology': "I'm not a psychologist. For mental health questions, consult a psychologist or counselor.",
+                'philosophy': "I'm not a philosopher. For philosophy questions, consult a philosophy expert.",
+                'religion': "I'm not a theologian. For religious questions, consult a religious leader or scholar.",
+                'language': "I'm not a linguist. For language questions, consult a linguist or language teacher.",
+                'translation': "I'm not a translator. For translation help, consult a language expert or translation service.",
+                'coding': "I'm not a programming assistant. For coding help, consult a developer or programming forum.",
+                'python': "I'm not a programming assistant. For coding help, consult a developer or programming forum.",
+                'java': "I'm not a programming assistant. For coding help, consult a developer or programming forum.",
+                'javascript': "I'm not a programming assistant. For coding help, consult a developer or programming forum.",
+                # ... (add hundreds more as needed, or load from a large list)
+            }
+            found_topic = None
+            for topic in topic_responses:
+                if topic in message_lower:
+                    found_topic = topic
+                    break
+            if found_topic:
+                response = topic_responses[found_topic]
+            else:
+                response = "I'm not able to help with that topic. Please ask about plants, gardening, or botany."
+            typing_delay = random.uniform(1, 2)
+        time.sleep(typing_delay)
         # Add bot response to history
         chat_sessions[session_id]['history'].append({'role': 'bot', 'message': response})
-        
-        # Keep only last 10 exchanges to manage memory
+        # Save bot message to DB
+        if user_id and SUPABASE_AVAILABLE and session_id != 'default':
+            save_message_to_db(session_id, user_id, 'bot', response)
         if len(chat_sessions[session_id]['history']) > 20:
             chat_sessions[session_id]['history'] = chat_sessions[session_id]['history'][-20:]
-        
         return jsonify({
             'response': response,
-            'type': 'success'
+            'type': 'success',
+            'typing': True,
+            'typing_delay': typing_delay
         })
-        
     except Exception as e:
         logging.error(f"Error in chat endpoint: {e}")
         return jsonify({'error': 'An error occurred while processing your message. Please try again.'}), 500
 
 def is_botanical_question(message):
-    """Check if the message is related to plants or botany"""
+    """Check if the message is related to plants or botany (expanded, smarter, typo-tolerant)"""
     botanical_keywords = [
+        # Core botanical terms
         'plant', 'flower', 'tree', 'leaf', 'leaves', 'garden', 'gardening', 'botany', 'botanical',
         'grow', 'growing', 'care', 'water', 'watering', 'soil', 'fertilizer', 'pruning', 'propagate',
         'succulent', 'cactus', 'herb', 'vegetable', 'fruit', 'seed', 'seeds', 'bloom', 'blooming',
@@ -952,67 +1127,166 @@ def is_botanical_question(message):
         'repot', 'repotting', 'transplant', 'mulch', 'compost', 'organic', 'disease', 'pest',
         'fungus', 'bacteria', 'virus', 'nutrient', 'nitrogen', 'phosphorus', 'potassium',
         'photosynthesis', 'respiration', 'transpiration', 'germination', 'phototropism',
-        'where', 'found', 'native', 'habitat', 'region', 'location', 'these', 'this', 'what', 'how', 'why',
-        'orchid', 'rose', 'fern', 'bamboo', 'palm', 'moss', 'algae', 'fungi', 'mushroom'
+        'orchid', 'rose', 'fern', 'bamboo', 'palm', 'moss', 'algae', 'fungi', 'mushroom',
+        # Common fruits and vegetables
+        'strawberry', 'apple', 'banana', 'grape', 'orange', 'lemon', 'lime', 'blueberry', 'raspberry',
+        'blackberry', 'melon', 'watermelon', 'cantaloupe', 'peach', 'pear', 'plum', 'cherry', 'apricot',
+        'kiwi', 'pineapple', 'mango', 'papaya', 'avocado', 'tomato', 'potato', 'carrot', 'onion', 'lettuce',
+        'spinach', 'broccoli', 'cabbage', 'cauliflower', 'pepper', 'chili', 'bean', 'pea', 'corn', 'squash',
+        'pumpkin', 'zucchini', 'radish', 'turnip', 'beet', 'celery', 'cucumber', 'eggplant', 'garlic', 'ginger',
+        'herbs', 'basil', 'mint', 'oregano', 'thyme', 'sage', 'parsley', 'cilantro', 'dill', 'rosemary',
+        # Other common plant names
+        'sunflower', 'daisy', 'tulip', 'lily', 'iris', 'daffodil', 'marigold', 'pansy', 'begonia', 'azalea',
+        'hydrangea', 'peony', 'camellia', 'gardenia', 'jasmine', 'lavender', 'magnolia', 'hibiscus', 'bougainvillea',
+        'carnation', 'chrysanthemum', 'fuchsia', 'geranium', 'petunia', 'snapdragon', 'zinnia', 'wisteria',
+        'holly', 'ivy', 'maple', 'oak', 'pine', 'cedar', 'birch', 'willow', 'elm', 'ash', 'spruce', 'fir',
     ]
-    
     message_lower = message.lower()
-    
-    # More lenient check - if it's a short question or contains common question words, allow it
-    if len(message.split()) <= 5 or any(word in message_lower for word in ['where', 'what', 'how', 'why', 'when', 'which']):
+    # Exact match
+    if any(keyword in message_lower for keyword in botanical_keywords):
         return True
-        
-    return any(keyword in message_lower for keyword in botanical_keywords)
+    # Fuzzy match for each word in message
+    words = message_lower.split()
+    for word in words:
+        close = difflib.get_close_matches(word, botanical_keywords, n=1, cutoff=0.8)
+        if close:
+            return True
+    return False
+
+def get_corrected_botanical_word(message):
+    """Return the closest botanical keyword for any word in the message, or None if not found."""
+    botanical_keywords = [
+        # Core botanical terms
+        'plant', 'flower', 'tree', 'leaf', 'leaves', 'garden', 'gardening', 'botany', 'botanical',
+        'grow', 'growing', 'care', 'water', 'watering', 'soil', 'fertilizer', 'pruning', 'propagate',
+        'succulent', 'cactus', 'herb', 'vegetable', 'fruit', 'seed', 'seeds', 'bloom', 'blooming',
+        'houseplant', 'indoor', 'outdoor', 'photosynthesis', 'chlorophyll', 'roots', 'stem', 'stems',
+        'petal', 'petals', 'pollen', 'pollination', 'species', 'variety', 'cultivar', 'hybrid',
+        'perennial', 'annual', 'biennial', 'evergreen', 'deciduous', 'tropical', 'temperate',
+        'light', 'sunlight', 'shade', 'humidity', 'temperature', 'climate', 'season', 'seasonal',
+        'repot', 'repotting', 'transplant', 'mulch', 'compost', 'organic', 'disease', 'pest',
+        'fungus', 'bacteria', 'virus', 'nutrient', 'nitrogen', 'phosphorus', 'potassium',
+        'photosynthesis', 'respiration', 'transpiration', 'germination', 'phototropism',
+        'orchid', 'rose', 'fern', 'bamboo', 'palm', 'moss', 'algae', 'fungi', 'mushroom',
+        # Common fruits and vegetables
+        'strawberry', 'apple', 'banana', 'grape', 'orange', 'lemon', 'lime', 'blueberry', 'raspberry',
+        'blackberry', 'melon', 'watermelon', 'cantaloupe', 'peach', 'pear', 'plum', 'cherry', 'apricot',
+        'kiwi', 'pineapple', 'mango', 'papaya', 'avocado', 'tomato', 'potato', 'carrot', 'onion', 'lettuce',
+        'spinach', 'broccoli', 'cabbage', 'cauliflower', 'pepper', 'chili', 'bean', 'pea', 'corn', 'squash',
+        'pumpkin', 'zucchini', 'radish', 'turnip', 'beet', 'celery', 'cucumber', 'eggplant', 'garlic', 'ginger',
+        'herbs', 'basil', 'mint', 'oregano', 'thyme', 'sage', 'parsley', 'cilantro', 'dill', 'rosemary',
+        # Other common plant names
+        'sunflower', 'daisy', 'tulip', 'lily', 'iris', 'daffodil', 'marigold', 'pansy', 'begonia', 'azalea',
+        'hydrangea', 'peony', 'camellia', 'gardenia', 'jasmine', 'lavender', 'magnolia', 'hibiscus', 'bougainvillea',
+        'carnation', 'chrysanthemum', 'fuchsia', 'geranium', 'petunia', 'snapdragon', 'zinnia', 'wisteria',
+        'holly', 'ivy', 'maple', 'oak', 'pine', 'cedar', 'birch', 'willow', 'elm', 'ash', 'spruce', 'fir',
+    ]
+    message_lower = message.lower()
+    words = message_lower.split()
+    for word in words:
+        close = difflib.get_close_matches(word, botanical_keywords, n=1, cutoff=0.8)
+        if close:
+            return close[0]
+    return None
 
 def generate_botanical_response_with_memory(message, session):
     """Generate smart botanical responses with conversation memory"""
+    # Restrict to botany/plant/gardening questions only (ultra strict, minimal)
+    if not is_botanical_question(message):
+        return "Please ask me about plants, gardening, or botany."
     try:
-        # Build context from recent conversation
+        # Build context from recent conversation (last 100 exchanges for deep memory)
         context = ""
         if session['history']:
-            recent_messages = session['history'][-6:]  # Last 3 exchanges
+            recent_messages = session['history'][-100:]  # Last 100 exchanges (user+bot)
             context = "Recent conversation:\n"
             for msg in recent_messages:
                 context += f"{msg['role'].title()}: {msg['message']}\n"
             context += "\n"
-        
+
+        # Friendly greeting for greetings
+        greetings = ['hi', 'hello', 'hey', 'greetings', 'good morning', 'good afternoon', 'good evening']
+        message_lower = message.lower().strip()
+        if any(greet in message_lower for greet in greetings) and len(message_lower.split()) <= 4:
+            time.sleep(1)  # Add a 1-second delay for greetings
+            return "Hello! I'm Lumon, your botanical expert. How can I help you today?"
+
+        # Determine if user wants a long answer
+        long_keywords = ['explain', 'more', 'details', 'elaborate', 'expand', 'long', 'full', 'in depth']
+        wants_long = any(word in message_lower for word in long_keywords)
+        # Detect if plant context is present
+        plant_context = ''
+        ambiguous_words = ['these', 'this', 'it', 'they', 'them', 'where are these', 'where is this', 'where is it', 'where are they']
+        if any(word in message_lower for word in ambiguous_words) and session.get('last_plant'):
+            plant = session['last_plant']
+            plant_context = f"\nPrevious plant identified: {plant.get('plant_name', '')} (Family: {plant.get('family', '')}, Region: {plant.get('region', '')})"
+            wants_long = True  # If plant context is present, allow long answer
+        max_len = 1000 if wants_long else 200
+        search_range = 200 if wants_long else 100
+        trunc_len = max_len - 3  # for safety
+
+        # Adaptive prompt
+        if wants_long:
+            prompt = f"""You are Lumon, a botanical expert. Provide a complete, helpful answer to the user's question. Use the context if relevant.
+
+{context}Current question: {message}{plant_context}
+
+Guidelines:
+- Give a full answer if needed.
+- Use simple, clear language.
+- End your answer with a period.
+
+Response:"""
+        else:
+            prompt = f"""You are Lumon, a botanical expert. Answer the user's question in 10 to 40 words, unless more is needed. Use the context if relevant.
+
+{context}Current question: {message}{plant_context}
+
+Guidelines:
+- Be clear and helpful.
+- End your answer with a period.
+
+Response:"""
+
         # Try Gemini Pro first
         if GOOGLE_API_KEY:
             try:
                 model = genai.GenerativeModel('gemini-1.5-flash')
-                
-                prompt = f"""You are Lumon, a concise botanical expert. Provide brief, practical answers (2-3 sentences max).
-
-{context}Current question: {message}
-
-Guidelines:
-- Keep responses under 100 words
-- Focus on actionable advice
-- Reference previous conversation when relevant
-- Use simple, clear language
-- Avoid repetitive information
-
-Response:"""
-
                 response = model.generate_content(prompt)
-                
                 if response and response.text:
                     result = response.text.strip()
-                    # Truncate if too long
-                    if len(result) > 300:
-                        result = result[:297] + "..."
+                    # Truncate if too long, but always end at the last period (full sentence)
+                    if len(result) > max_len:
+                        truncated = result[:trunc_len]
+                        last_period = truncated.rfind('.')
+                        if last_period != -1:
+                            result = truncated[:last_period+1]
+                        else:
+                            # Try to find the next period after trunc_len (within next search_range chars)
+                            next_period = result.find('.', trunc_len, trunc_len + search_range)
+                            if next_period != -1:
+                                result = result[:next_period+1]
+                            else:
+                                last_space = truncated.rfind(' ')
+                                if last_space != -1:
+                                    result = truncated[:last_space]
+                                else:
+                                    result = truncated  # fallback if no space
+                    # Always end with a period
+                    if not result.endswith('.'):
+                        last_period = result.rfind('.')
+                        if last_period != -1:
+                            result = result[:last_period+1]
                     return result
                 else:
                     logging.warning("Empty response from Gemini, falling back to DeepSeek")
                     return generate_deepseek_response_with_memory(message, session)
-                    
             except Exception as e:
                 logging.error(f"Error with Gemini API: {e}")
                 return generate_deepseek_response_with_memory(message, session)
         else:
             logging.warning("Gemini API key not available, using DeepSeek")
             return generate_deepseek_response_with_memory(message, session)
-            
     except Exception as e:
         logging.error(f"Error in botanical response generation: {e}")
         return generate_smart_fallback_response(message, session)
@@ -1028,40 +1302,43 @@ def generate_deepseek_response_with_memory(message, session):
         if not together_client:
             logging.warning("Together AI client not available, using fallback")
             return generate_smart_fallback_response(message, session)
-        
         # Build context
         context = ""
         if session['history']:
             recent_messages = session['history'][-4:]  # Last 2 exchanges
             for msg in recent_messages:
                 context += f"{msg['role'].title()}: {msg['message']}\n"
-        
-        prompt = f"""You are Lumon, a concise botanical expert. Keep responses under 80 words.
-
-{context}
-Current question: {message}
-
-Provide brief, practical advice. Reference previous context when relevant.
-
-Response:"""
-        
+        # Detect if user wants long answer or plant context is present
+        long_keywords = ['explain', 'more', 'details', 'elaborate', 'expand', 'long', 'full', 'in depth']
+        wants_long = any(word in message.lower() for word in long_keywords)
+        plant_context = ''
+        ambiguous_words = ['these', 'this', 'it', 'they', 'them', 'where are these', 'where is this', 'where is it', 'where are they']
+        if any(word in message.lower() for word in ambiguous_words) and session.get('last_plant'):
+            plant = session['last_plant']
+            plant_context = f"\nPrevious plant identified: {plant.get('plant_name', '')} (Family: {plant.get('family', '')}, Region: {plant.get('region', '')})"
+            wants_long = True
+        # Adaptive prompt
+        if wants_long:
+            prompt = f"""You are Lumon, a botanical expert. Provide a complete, helpful answer to the user's question. Use the context if relevant.\n\n{context}Current question: {message}{plant_context}\n\nGuidelines:\n- Give a full answer if needed.\n- Use simple, clear language.\n- End your answer with a period.\n\nResponse:"""
+        else:
+            prompt = f"""You are Lumon, a botanical expert. Answer the user's question in a clear, helpful way. Use the context if relevant.\n\n{context}Current question: {message}{plant_context}\n\nGuidelines:\n- Be clear and helpful.\n- End your answer with a period.\n\nResponse:"""
         response = together_client.chat.completions.create(
             model="meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=150,
+            max_tokens=512,
             temperature=0.6
         )
-        
         if response.choices and response.choices[0].message:
             result = response.choices[0].message.content.strip()
-            # Ensure conciseness
-            if len(result) > 250:
-                result = result[:247] + "..."
+            # Always end at the last period
+            if not result.endswith('.'):
+                last_period = result.rfind('.')
+                if last_period != -1:
+                    result = result[:last_period+1]
             return result
         else:
             logging.warning("Empty response from DeepSeek, using fallback")
             return generate_smart_fallback_response(message, session)
-            
     except Exception as e:
         logging.error(f"Error with DeepSeek API: {e}")
         return generate_smart_fallback_response(message, session)
@@ -1260,7 +1537,9 @@ def register():
                 "message": "Registration successful! Please check your email and confirm your account before logging in."
             }), 201
         else:
-            return jsonify({"success": False, "error": result.get("error", "Registration failed.")}), 400
+            # Return specific error for username or email already exists
+            error_msg = result.get("error", "Registration failed.")
+            return jsonify({"success": False, "error": error_msg}), 400
 
     except Exception as e:
         logging.error(f"Registration error: {e}")
@@ -1273,26 +1552,23 @@ def login():
         data = request.get_json()
         email = data.get('email')
         password = data.get('password')
-
         if not all([email, password]):
             return jsonify({"success": False, "error": "Missing email or password"}), 400
-
         if not SUPABASE_AVAILABLE:
             return jsonify({"success": False, "error": "Database not available"}), 503
-
         result = db_service.authenticate_user(email, password)
-
         if result["success"]:
             # Check if user is confirmed
             if result.get("user_confirmed") is False:
                 return jsonify({"success": False, "error": "Please confirm your email before logging in."}), 401
+            session.clear()
             session['user_id'] = result["user_id"]
             session['authenticated'] = True
+            session.permanent = True  # Make session cookie persistent
             return jsonify({"success": True, "message": "Login successful"}), 200
         else:
             error_msg = result.get("error", "Invalid email or password.")
             return jsonify({"success": False, "error": error_msg}), 401
-
     except Exception as e:
         logging.error(f"Login error: {e}")
         return jsonify({"success": False, "error": "Internal server error"}), 500
@@ -1309,7 +1585,6 @@ def logout():
 
 @app.route('/api/oauth/session', methods=['POST'])
 def oauth_session():
-    """Establish session from Google OAuth access_token sent from frontend JS after Supabase redirect"""
     if not SUPABASE_AVAILABLE:
         return jsonify({"success": False, "error": "Database not available"}), 503
     try:
@@ -1317,7 +1592,6 @@ def oauth_session():
         access_token = data.get('access_token')
         if not access_token:
             return jsonify({"success": False, "error": "Missing access token"}), 400
-        # Validate token with Supabase and get user info
         from supabase import create_client
         supabase_url = os.environ.get('SUPABASE_URL')
         supabase_anon = os.environ.get('SUPABASE_ANON_KEY')
@@ -1327,6 +1601,7 @@ def oauth_session():
             session.clear()
             session['user_id'] = user_response.user.id
             session['authenticated'] = True
+            session.permanent = True
             return jsonify({"success": True, "message": "OAuth login successful"}), 200
         else:
             return jsonify({"success": False, "error": "Invalid or expired token"}), 401
@@ -1336,18 +1611,18 @@ def oauth_session():
 
 @app.route('/api/user/profile', methods=['GET'])
 def get_profile():
-    """Get current user profile"""
     try:
         user_id = session.get('user_id')
         if not user_id:
             return jsonify({"success": False, "error": "Not authenticated"}), 401
-        
         if not SUPABASE_AVAILABLE:
             return jsonify({"success": False, "error": "Database not available"}), 503
-        
         result = db_service.get_user_profile(user_id)
+        # PATCH: Ensure profile_pic_url is included
+        if result.get('success') and 'profile' in result:
+            if 'profile_pic_url' not in result['profile']:
+                result['profile']['profile_pic_url'] = None
         return jsonify(result), 200 if result["success"] else 404
-        
     except Exception as e:
         logging.error(f"Profile error: {e}")
         return jsonify({"success": False, "error": "Internal server error"}), 500
@@ -1389,6 +1664,141 @@ def auth_google_callback():
     # After Google login, Supabase will redirect here with access_token in fragment (not query)
     # Frontend JS will extract the token and call /api/oauth/session
     return render_template('google_oauth_callback.html')
+
+@app.route('/')
+def landing():
+    # Always show landing page, regardless of authentication status
+    return render_template('landing.html')
+
+@app.route('/settings')
+def settings():
+    return render_template('settings.html')
+
+@app.route('/history')
+def history():
+    return render_template('history.html')
+
+@app.route('/page0')
+def page0():
+    return render_template('page0.html')
+
+@app.route('/page1')
+def page1():
+    return render_template('page1.html')
+
+@app.route('/page2')
+def page2():
+    return render_template('page2.html')
+@app.route('/health')
+def health():
+    return "OK", 200
+
+@app.route('/api/user/update_username', methods=['POST'])
+def update_username():
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+    data = request.get_json()
+    username = data.get('username')
+    if not username:
+        return jsonify({'success': False, 'error': 'Missing username'}), 400
+    result = db_service.update_username(session['user_id'], username)
+    if result.get('success'):
+        return jsonify({'success': True}), 200
+    else:
+        return jsonify({'success': False, 'error': result.get('error', 'Failed to update username')}), 400
+
+@app.route('/api/user/update_password', methods=['POST'])
+def update_password():
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+    data = request.get_json()
+    old_password = data.get('old_password')
+    new_password = data.get('new_password')
+    if not old_password or not new_password:
+        return jsonify({'success': False, 'error': 'Missing password fields'}), 400
+    result = db_service.update_password(session['user_id'], old_password, new_password)
+    if result.get('success'):
+        return jsonify({'success': True}), 200
+    else:
+        return jsonify({'success': False, 'error': result.get('error', 'Failed to update password')}), 400
+
+@app.route('/api/user/update_country', methods=['POST'])
+def update_country():
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+    data = request.get_json()
+    country = data.get('country')
+    if not country:
+        return jsonify({'success': False, 'error': 'Missing country'}), 400
+    result = db_service.update_country(session['user_id'], country)
+    if result.get('success'):
+        return jsonify({'success': True}), 200
+    else:
+        return jsonify({'success': False, 'error': result.get('error', 'Failed to update country')}), 400
+
+@app.route('/api/user/upload_profile_pic', methods=['POST'])
+def upload_profile_pic():
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+    if 'profile_pic' not in request.files:
+        return jsonify({'success': False, 'error': 'No file uploaded'}), 400
+    file = request.files['profile_pic']
+    if file.filename == '':
+        return jsonify({'success': False, 'error': 'No selected file'}), 400
+    uploads_dir = os.path.join(os.getcwd(), 'uploads')
+    os.makedirs(uploads_dir, exist_ok=True)
+    filename = f"{session['user_id']}_profile_{file.filename}"
+    file_path = os.path.join(uploads_dir, filename)
+    file.save(file_path)
+    file_url = f"/uploads/{filename}"
+    result = db_service.update_profile_pic(session['user_id'], file_url)
+    # PATCH: Ensure profile_pic_url is updated
+    if result.get('success'):
+        return jsonify({'success': True, 'file_url': file_url}), 200
+    else:
+        return jsonify({'success': False, 'error': result.get('error', 'Failed to update profile picture')}), 400
+
+# --- NEW: Chat message persistence ---
+@app.route('/api/user/history', methods=['GET'])
+def get_user_history():
+    """Fetch chat history for the logged-in user from Supabase."""
+    if 'user_id' not in session:
+        return jsonify({'success': False, 'error': 'Not authenticated'}), 401
+    if not SUPABASE_AVAILABLE:
+        return jsonify({'success': False, 'error': 'Database not available'}), 503
+    try:
+        user_id = session['user_id']
+        # Fetch chat sessions for user
+        sessions_result = db_service.get_user_chat_sessions(user_id)
+        if not sessions_result['success']:
+            return jsonify({'success': False, 'error': 'Could not fetch chat sessions'}), 400
+        chat_sessions_list = sessions_result['sessions']
+        # For each session, fetch messages
+        all_history = []
+        for sess in chat_sessions_list:
+            session_id = sess['id']
+            messages_result = db_service.get_chat_messages(session_id, user_id)
+            if messages_result['success']:
+                all_history.append({
+                    'session_id': session_id,
+                    'created_at': sess['created_at'],
+                    'messages': messages_result['messages']
+                })
+        return jsonify({'success': True, 'history': all_history}), 200
+    except Exception as e:
+        logging.error(f"Error fetching user history: {e}")
+        return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+# --- NEW: Save chat message to Supabase ---
+def save_message_to_db(session_id, user_id, role, message):
+    if not SUPABASE_AVAILABLE:
+        return False
+    try:
+        db_service.save_chat_message(session_id, user_id, role, message)
+        return True
+    except Exception as e:
+        logging.error(f"Error saving chat message: {e}")
+        return False
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
